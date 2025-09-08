@@ -2645,7 +2645,8 @@ class ObjectDynamicsDLP(nn.Module):
                      logvar_prior,
                      batch_size,
                      num_static,
-                     balance):
+                     balance,
+                     discount):
         mu_posterior = mu_posterior.reshape(
             batch_size, 
             self.timestep_horizon + 1, 
@@ -2659,14 +2660,18 @@ class ObjectDynamicsDLP(nn.Module):
         
 
         mu_prior = mu_prior[:, num_static - 1:].reshape(-1, mu_prior.shape[-1])
-        logvar_prior = logvar_prior[:, num_static - 1:].reshape(-1,logvar_bg_features_dyn.shape[
+        logvar_prior = logvar_prior[:, num_static - 1:].reshape(-1,logvar_prior.shape[
                                                                                                  -1])
         
-        loss_kl_bg_dyn = calc_kl(mu=mu_posterior,
+        loss_kl_dyn = calc_kl(mu=mu_posterior,
                                  logvar=logvar_posterior,
                                  mu_o=mu_prior,
                                  logvar_o=logvar_prior,
                                  reduce='none', balance=balance)
+        loss_kl_dyn = (loss_kl_dyn.view(batch_size, -1, self.n_kp_enc)).sum(-1)
+        loss_kl_dyn = (loss_kl_dyn * discount[None, :]).sum(-1).mean()
+        return loss_kl_dyn
+
     def LDYN(self,
                      obj_on_a,
                      obj_on_b,
@@ -2680,6 +2685,18 @@ class ObjectDynamicsDLP(nn.Module):
                      logvar_scale,
                      mu_scale_dyn,
                      logvar_scale_dyn,
+                     mu_depth,
+                     logvar_depth,
+                     mu_depth_dyn,
+                     logvar_depth_dyn,
+                     mu_features,
+                     logvar_features,
+                     mu_features_dyn,
+                     logvar_features_dyn,
+                     mu_bg,
+                     logvar_bg,
+                     mu_bg_dyn,
+                     logvar_bg_dyn,
                      batch_size,
                      num_static,
                      balance,
@@ -2724,124 +2741,72 @@ class ObjectDynamicsDLP(nn.Module):
         # position
 
         # posteriors for postion
-        mu_dyn_post_offset = mu_tot.reshape(
-            batch_size, 
-            self.timestep_horizon + 1, 
-            *mu_tot.shape[1:])[:, num_static:]
-        mu_dyn_post_offset = mu_dyn_post_offset.reshape(-1, mu_dyn_post_offset.shape[-1])
-        mu_dyn_prior = mu_dyn[:, num_static - 1:].reshape(-1, mu_dyn.shape[-1])
-
-        logvar_dyn_post_offset = logvar_tot.reshape(
-            batch_size, 
-            self.timestep_horizon + 1, *logvar_tot.shape[1:])[:,
-                                 num_static:]
-        logvar_dyn_post_offset = logvar_dyn_post_offset.reshape(-1, logvar_dyn_post_offset.shape[-1])
-        logvar_dyn_prior = logvar_dyn[:, num_static - 1:].reshape(-1, logvar_dyn.shape[-1])
-
-        loss_kl_kp_dyn_offset = calc_kl(logvar=logvar_dyn_post_offset,
-                                        mu=mu_dyn_post_offset,
-                                        mu_o=mu_dyn_prior,
-                                        logvar_o=logvar_dyn_prior,
-                                        reduce='none',
-                                        balance=balance)
-        
-
-        loss_kl_kp_dyn = loss_kl_kp_dyn_offset
-        loss_kl_kp_dyn = (loss_kl_kp_dyn.view(batch_size, -1, self.n_kp_enc)).sum(-1)
-        loss_kl_kp_dyn = (loss_kl_kp_dyn * discount[None, :]).sum(-1).mean()
+        loss_kl_kp_dyn = self.calc_pint_kl(
+            mu_posterior = mu_tot,
+            logvar_posterior=logvar_tot,
+            mu_prior=mu_dyn,
+            logvar_prior=logvar_dyn,
+            batch_size=batch_size,
+            num_static=num_static,
+            discount = discount
+        )
 
         # scale
-
-        # posteriors for scale 
-        mu_scale_dyn_post = mu_scale.reshape(
-            batch_size, 
-            self.timestep_horizon + 1, 
-            *mu_scale.shape[1:])[:, num_static:]
-        mu_scale_dyn_post = mu_scale_dyn_post.reshape(-1, mu_scale_dyn_post.shape[-1])
-
-        logvar_scale_dyn_post = logvar_scale.reshape(
-            batch_size, 
-            self.timestep_horizon + 1, 
-            *logvar_scale.shape[1:])[:,
-                                num_static:]
-        logvar_scale_dyn_post = logvar_scale_dyn_post.reshape(-1, logvar_scale_dyn_post.shape[-1])
-        
-        mu_scale_prior = mu_scale_dyn[:, num_static - 1:].reshape(-1, mu_scale_dyn.shape[-1])
-        logvar_scale_prior= logvar_scale_dyn[:, num_static - 1:].reshape(-1,logvar_scale_dyn.shape[-1])
-
-        loss_kl_scale_dyn = calc_kl(logvar=logvar_scale_dyn_post,
-                                    mu=mu_scale_dyn_post,
-                                    mu_o=mu_scale_prior,
-                                    logvar_o=logvar_scale_prior,
-                                    reduce='none', balance=balance)
-        loss_kl_scale_dyn = (loss_kl_scale_dyn.view(batch_size, -1, self.n_kp_enc)).sum(-1)
-        loss_kl_scale_dyn = (loss_kl_scale_dyn * discount[None, :]).sum(-1).mean()
+        loss_kl_scale_dyn = self.calc_pint_kl(
+            mu_posterior = mu_scale,
+            logvar_posterior=logvar_scale,
+            mu_prior=mu_scale_dyn,
+            logvar_prior=logvar_scale_dyn,
+            batch_size=batch_size,
+            num_static=num_static,
+            discount = discount
+        )
 
         # depth
-        mu_depth_dyn_post = mu_depth.reshape(batch_size, timestep_horizon + 1, *mu_depth.shape[1:])[:, num_static:]
-        mu_depth_dyn_post = mu_depth_dyn_post.reshape(-1, mu_depth_dyn_post.shape[-1])
-        mu_depth_dyn_prior = mu_depth_dyn[:, num_static - 1:].reshape(-1, mu_depth_dyn.shape[-1])
+        loss_kl_depth_dyn = self.calc_pint_kl(
+            mu_posterior = mu_depth,
+            logvar_posterior=logvar_depth,
+            mu_prior=mu_depth_dyn,
+            logvar_prior=logvar_depth_dyn,
+            batch_size=batch_size,
+            num_static=num_static,
+            discount = discount
+        )
 
-        logvar_depth_dyn_post = logvar_depth.reshape(batch_size, timestep_horizon + 1, *logvar_depth.shape[1:])[:,
-                                num_static:]
-        logvar_depth_dyn_post = logvar_depth_dyn_post.reshape(-1, logvar_depth_dyn_post.shape[-1])
-        logvar_depth_dyn_prior = logvar_depth_dyn[:, num_static - 1:].reshape(-1,
-                                                                                          logvar_depth_dyn.shape[-1])
-        
-        loss_kl_depth_dyn = calc_kl(logvar=logvar_depth_dyn_post,
-                                    mu=mu_depth_dyn_post,
-                                    mu_o=mu_depth_dyn_prior,
-                                    logvar_o=logvar_depth_dyn_prior,
-                                    reduce='none', balance=balance)
-        
-        loss_kl_depth_dyn = (loss_kl_depth_dyn.view(batch_size, -1, self.n_kp_enc)).sum(-1)
-        loss_kl_depth_dyn = (loss_kl_depth_dyn * discount[None, :]).sum(-1).mean()
-
+    
         # features
-        mu_features_dyn_post = mu_features.reshape(
-            batch_size, 
-            self.timestep_horizon + 1, 
-            *mu_features.shape[1:])[:,
-                               num_static:]
-        mu_features_dyn_post = mu_features_dyn_post.reshape(-1, mu_features_dyn_post.shape[-1])
-        mu_features_dyn_prior = mu_features_dyn[:, num_static - 1:].reshape(-1, mu_features_dyn.shape[-1])
+        loss_kl_features_dyn = self.calc_pint_kl(
+            mu_posterior = mu_features,
+            logvar_posterior=logvar_features,
+            mu_prior=mu_features_dyn,
+            logvar_prior=logvar_features_dyn,
+            batch_size=batch_size,
+            num_static=num_static,
+            discount = discount
+        )
 
-        logvar_features_dyn_post = logvar_features.reshape(
-            batch_size, 
-            self.timestep_horizon + 1,
-            *logvar_features.shape[1:])[:, num_static:]
-        logvar_features_dyn_post = logvar_features_dyn_post.reshape(-1, logvar_features_dyn_post.shape[-1])
-        logvar_features_dyn_prior = logvar_features_dyn[:, num_static - 1:].reshape(-1,
-                                                                                                logvar_features_dyn.shape[
-                                                                                                    -1])
-        
-        loss_kl_features_dyn = calc_kl(logvar=logvar_features_dyn_post,
-                                       mu=mu_features_dyn_post,
-                                       mu_o=mu_features_dyn_prior,
-                                       logvar_o=logvar_features_dyn_prior,
-                                       reduce='none', balance=balance)
-        loss_kl_features_dyn = (
-            loss_kl_features_dyn.view(batch_size, -1, self.n_kp_enc)).sum(-1)
-        loss_kl_features_dyn = (loss_kl_features_dyn * discount[None, :]).sum(-1).mean()
-
+       
         # bg featuers
-        mu_bg_dyn_post = mu_bg.reshape(batch_size, self.timestep_horizon + 1, *mu_bg.shape[1:])[:, num_static:]
-        logvar_bg_dyn_post = logvar_bg.reshape(batch_size, self.timestep_horizon + 1, *logvar_bg.shape[1:])[:, num_static:]
-        loss_kl_bg_dyn = calc_kl(logvar_bg_dyn_post.reshape(-1, logvar_bg_dyn_post.shape[-1]),
-                                 mu_bg_dyn_post.reshape(-1, mu_bg_dyn_post.shape[-1]),
-                                 mu_o=mu_bg_features_dyn[:, num_static - 1:].reshape(-1, mu_bg_features_dyn.shape[-1]),
-                                 logvar_o=logvar_bg_features_dyn[:, num_static - 1:].reshape(-1,
-                                                                                             logvar_bg_features_dyn.shape[
-                                                                                                 -1]),
-                                 reduce='none', balance=balance)
-        loss_kl_bg_dyn = loss_kl_bg_dyn.view(batch_size, -1)
-        loss_kl_bg_dyn = (loss_kl_bg_dyn * discount[None, :]).sum(-1).mean()
+        loss_kl_bg_dyn = self.calc_pint_kl(
+            mu_posterior = mu_bg,
+            logvar_posterior=logvar_bg,
+            mu_prior=mu_bg_dyn,
+            logvar_prior=logvar_bg_dyn,
+            batch_size=batch_size,
+            num_static=num_static,
+            discount = discount
+        )
 
+     
         # total dynamics kl
-        loss_kl_dyn = sum([loss_kl_kp_dyn, loss_kl_obj_on_dyn, loss_kl_depth_dyn, loss_kl_scale_dyn,
-                           loss_kl_features_dyn, loss_kl_bg_dyn])
+        return sum([loss_kl_kp_dyn, 
+                    loss_kl_obj_on_dyn, 
+                    loss_kl_depth_dyn, 
+                    loss_kl_scale_dyn,
+                    loss_kl_features_dyn, 
+                    loss_kl_bg_dyn])
 
-        # --- end kl-divergence for t >= tau --- #
+
 
                    
     def LDLP(self,
@@ -2868,6 +2833,13 @@ class ObjectDynamicsDLP(nn.Module):
                      kl_balance=0.001,
                      warmup=False,
                      noisy=False):
+        """
+         for t < τ , also termed burn-in frames (Wu et al., 2022), 
+         we use the standard constant prior parameters as in
+         the single-image DLP, detailed in Appendix D.2, 
+         to calculate the KL-divergence term (similarly to Wu et al.
+         2022, we set τ = 4 in all our experiments).
+        """
         # TODO refactor to accept as parameters what is needed for an arbitrary KL calculation
         
         # --- define priors ---- 
@@ -2992,9 +2964,11 @@ class ObjectDynamicsDLP(nn.Module):
         loss_kl_feat = loss_kl_feat_obj + loss_kl_feat_bg
 
         # --- end kl-divergence for t < tau --- #
-        return loss_kl_depth, loss_kl_scale, loss_kl_obj_on, loss_kl_feat,obj_on_l1
+        loss_kl = loss_kl_kp + loss_kl_scale + loss_kl_obj_on + kl_balance * (loss_kl_feat + loss_kl_depth)
+        # return loss_kl_depth, loss_kl_scale, loss_kl_obj_on, loss_kl_feat,obj_on_l1,loss_kl_kp
+        return loss_kl, loss_kl_depth, loss_kl_scale, loss_kl_obj_on, loss_kl_feat,obj_on_l1,loss_kl_kp
 
-    def computeReconError(self,
+    def LREC(self,
                           x,
                           model_output,
                           discount,
@@ -3064,7 +3038,9 @@ class ObjectDynamicsDLP(nn.Module):
                   balance=0.5,
                   beta_dyn_rec=0.1, 
                   num_static=4, 
-                  noisy=False):
+                  noisy=False,
+                  static_scale = 1, 
+                  dyn_scale = 1 ):
         # discount for future steps
         if dynamic_discount is None:
             discount = torch.ones(size=(self.timestep_horizon - num_static + 1,), device=x.device)
@@ -3072,7 +3048,8 @@ class ObjectDynamicsDLP(nn.Module):
             discount = dynamic_discount[:self.timestep_horizon - num_static + 1]
 
         # compute the reconstruction loss 
-        loss_rec, psnr = self.computeReconError(
+        # for all frames 
+        loss_rec, psnr = self.LREC(
             x,
             model_output=model_output,
             discount=discount,
@@ -3081,8 +3058,10 @@ class ObjectDynamicsDLP(nn.Module):
             num_static=num_static
         )
 
-        # compute loss for t < tau
-        loss_kl_depth, loss_kl_scale, loss_kl_obj_on, loss_kl_feat = self.computeKLDiv(
+        # compute loss for burn-in frames (t < Tau) 
+        # using the Chamfer-KL loss 
+        # with standard priors 
+        loss_kl, loss_kl_depth, loss_kl_scale, loss_kl_obj_on, loss_kl_feat,obj_on_l1,loss_kl_kp = self.LDLP(
             model_output=model_output,
             batch_size=x.shape[0],
             num_static=num_static,
@@ -3091,7 +3070,62 @@ class ObjectDynamicsDLP(nn.Module):
             noisy = noisy
         )
 
-        # compute loss for t >= tau
+        # compute loss for 'normal' frames (t >= Tau) 
+        # using PINT priors 
+        # with KL divergence (instead of Chamfer KL)
+        loss_kl_dyn = self.LDYN(
+            obj_on_a = model_output['obj_on_a'],
+                     obj_on_b=model_output['obj_on_b'],
+                     obj_on_a_dyn=model_output['obj_on_a_dyn'],
+                     obj_on_b_dyn=model_output['obj_on_b_dyn'],
+                     mu_tot=model_output['mu_tot'],
+                     logvar_tot=model_output['logvar_tot'],
+                     mu_dyn=model_output['mu_dyn'],
+                     logvar_dyn=model_output['logvar_dyn'],
+                     mu_scale=model_output['mu_scale'],
+                     logvar_scale=model_output['logvar_scale'],
+                     mu_scale_dyn=model_output['mu_scale_dyn'],
+                     logvar_scale_dyn=model_output['logvar_scale_dyn'],
+                     mu_depth=model_output['mu_depth'],
+                     logvar_depth=model_output['logvar_depth'],
+                     mu_depth_dyn=model_output['mu_depth_dyn'],
+                     logvar_depth_dyn=model_output['logvar_depth_dyn'],
+                     mu_features=model_output['mu_features'],
+                     logvar_features=model_output['logvar_features'],
+                     mu_features_dyn=model_output['mu_features_dyn'],
+                     logvar_features_dyn=model_output['logvar_features_dyn'],
+                     mu_bg=model_output['mu_bg'],
+                     logvar_bg=model_output['logvar_bg'],
+                     mu_bg_dyn=model_output['mu_bg_dyn'],
+                     logvar_bg_dyn=model_output['logvar_bg_dyn'],
+                     batch_size=model_output['batch_size'],
+                     num_static=num_static,
+                     balance=balance,
+                     discount=discount
+        )
+ 
+        # total losses
+        loss = (1 / (self.timestep_horizon + 1)) * (
+                beta_rec * loss_rec + 
+                beta_kl * static_scale * loss_kl + 
+                beta_dyn * dyn_scale * loss_kl_dyn)
+
+        if self.recon_loss_type == "vgg":
+            loss = 1e-3 * loss
+        
+        # loss dict
+        return {'loss': loss, 
+                     'psnr': psnr.detach(), 
+                     'kl': loss_kl, 
+                     'kl_dyn': loss_kl_dyn, 
+                     'loss_rec': loss_rec,
+                     'obj_on_l1': obj_on_l1, 
+                     'loss_kl_kp': loss_kl_kp, 
+                     'loss_kl_feat': loss_kl_feat,
+                     'loss_kl_obj_on': loss_kl_obj_on, 
+                     'loss_kl_scale': loss_kl_scale, 
+                      'loss_kl_depth': loss_kl_depth}
+     
     def calc_elbo(self, x, model_output, 
                   warmup=False, 
                   beta_kl=0.05, 
