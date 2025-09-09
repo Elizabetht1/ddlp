@@ -2643,6 +2643,83 @@ class ObjectDynamicsDLP(nn.Module):
 
         return output_dict
 
+    def mc_mog_kl(self,
+               z,
+               mu_theta,
+               var_theta,
+               mu_beta,
+               var_beta,
+               pi):
+        """
+        Perform a MC sample of Eq(w|y)p(z|x,w) [KLqφx(x|y)||pβ(x|w, z)]
+
+        z = latent representation 
+        K = number of clusters in the mixture (default 16)
+        mu_prior_conditional
+        var_prior_conditional
+        pi = mixing probability (shape is K x 1)
+    
+        """
+
+        # ----- collect priors ----- #
+        # the prior of the latent w is N(0,I)
+
+        # the prior for y is _
+
+        # the prior for 
+
+
+        # TODO confirm this creates K independent
+        # normals given vectors of length K
+        npdf= torch.distributions.normal.Normal(loc=mu_beta,
+                                                     scale = torch.sqrt(var_beta))
+            
+        E_j = pi * npdf.log_prob(z).exp()
+        denom = torch.sum(E_j)
+
+        prob_z = E_j / denom
+
+        # ----- compute KL divergence per cluster ---- #
+        KL = calc_kl(mu=mu_theta,
+            var=var_theta,
+            mu_o=mu_beta, 
+            var_o=var_beta,
+            reduce='none')
+        
+        return torch.sum(prob_z*KL) 
+    
+    def mog_kl(self,
+               mu_post,
+               var_post,
+               pi=None,
+               M=10,
+               ):
+        
+        K = mu_post.shape[0]
+        ## TODO figure out what kind of distribution this is 
+        dist_post = torch.distributions.normal.Normal(
+            loc=mu_post,
+            scale = torch.sqrt(var_post))
+        
+        # draw M samples from the normal distribution
+        z = torch.normal(mean=mu_post.repeat(M),
+                         std=torch.sqrt(var_post).repeat(M))
+
+        # draw M the prior of w
+        w = torch.normal(mean = torch.zeors(M),
+                         std = torch.ones(M))
+        
+        # compute the forward pass of the model through w
+        mu_beta, var_beta = self.forward(w)
+
+        if not pi:
+            pi = torch.ones(K).pow(-1)
+
+        return self.mc_mog_kl(z,mu_post,var_post,mu_beta,var_beta,pi)
+
+
+
+
     def calc_pint_kl(self,
                      mu_posterior,
                      logvar_posterior,
