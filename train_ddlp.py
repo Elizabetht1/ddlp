@@ -112,17 +112,34 @@ def train_ddlp(config_path='./configs/balls.json'):
     dataloader = DataLoader(dataset, shuffle=True, batch_size=batch_size, num_workers=4, pin_memory=True,
                             drop_last=True)
     # model
-    model = ObjectDynamicsDLP(cdim=ch, enc_channels=enc_channels, prior_channels=prior_channels,
-                              image_size=image_size, n_kp=n_kp, learned_feature_dim=learned_feature_dim,
-                              pad_mode=pad_mode, sigma=sigma,
-                              dropout=dropout, patch_size=patch_size, n_kp_enc=n_kp_enc,
-                              n_kp_prior=n_kp_prior, kp_range=kp_range, kp_activation=kp_activation,
-                              anchor_s=anchor_s, use_resblock=use_resblock,
-                              timestep_horizon=timestep_horizon, predict_delta=predict_delta,
-                              scale_std=scale_std, offset_std=offset_std, obj_on_alpha=obj_on_alpha,
-                              obj_on_beta=obj_on_beta, pint_layers=pint_layers, pint_heads=pint_heads,
-                              pint_dim=pint_dim, use_correlation_heatmaps=use_correlation_heatmaps,
-                              enable_enc_attn=enable_enc_attn, filtering_heuristic=filtering_heuristic).to(device)
+    model = ObjectDynamicsDLP(cdim=ch, 
+                              enc_channels=enc_channels, 
+                              prior_channels=prior_channels,
+                              image_size=image_size, 
+                              n_kp=n_kp, 
+                              learned_feature_dim=learned_feature_dim,
+                              pad_mode=pad_mode, 
+                              sigma=sigma,
+                              dropout=dropout, 
+                              patch_size=patch_size, 
+                              n_kp_enc=n_kp_enc,
+                              n_kp_prior=n_kp_prior, 
+                              kp_range=kp_range, 
+                              kp_activation=kp_activation,
+                              anchor_s=anchor_s, 
+                              use_resblock=use_resblock,
+                              timestep_horizon=timestep_horizon, 
+                              predict_delta=predict_delta,
+                              scale_std=scale_std, 
+                              offset_std=offset_std, 
+                              obj_on_alpha=obj_on_alpha,
+                              obj_on_beta=obj_on_beta, 
+                              pint_layers=pint_layers, 
+                              pint_heads=pint_heads,
+                              pint_dim=pint_dim, 
+                              use_correlation_heatmaps=use_correlation_heatmaps,
+                              enable_enc_attn=enable_enc_attn, 
+                              filtering_heuristic=filtering_heuristic).to(device)
     print(model.info())
     # prepare saving location
     run_name = f'{ds}_ddlp' + run_prefix
@@ -196,34 +213,77 @@ def train_ddlp(config_path='./configs/balls.json'):
         pbar = tqdm(iterable=dataloader)
         for batch in pbar:
             x = batch[0].to(device)
-            x_prior = x  # the input image to the prior is the same as the posterior
+
+            # the input image to the prior is the same as the posterior
+            # TODO understand this
+            x_prior = x  
+
             noisy = (epoch < (warmup_epoch + 1))
             forward_dyn = (epoch >= start_epoch)  # forward through the dynamics module
+            
             # forward pass
-            model_output = model(x, x_prior=x_prior, warmup=(epoch < warmup_epoch), noisy=noisy, bg_masks_from_fg=False,
-                                 forward_dyn=forward_dyn, train_enc_prior=train_enc_prior,
+            model_output = model(x, 
+                                 x_prior=x_prior, 
+                                 warmup=(epoch < warmup_epoch), 
+                                 noisy=noisy, 
+                                 bg_masks_from_fg=False,
+                                 forward_dyn=forward_dyn, 
+                                 train_enc_prior=train_enc_prior,
                                  num_static_frames=num_static_frames)
+            
             # calculate loss
+            #TODO understand start_epoch 
             if epoch >= start_epoch:
+                #TODO understand discount 
                 discount = iteration / torch.tensor(max_iterations_per_step, device=x.device)
                 discount = discount.clamp(0.0, 1.0)
                 iteration += 1
 
-                all_losses = model.calc_elbo(x, model_output, warmup=(epoch < warmup_epoch), beta_kl=beta_kl,
-                                             beta_dyn=beta_dyn, beta_rec=beta_rec, kl_balance=kl_balance,
-                                             dynamic_discount=discount, recon_loss_type=recon_loss_type,
-                                             recon_loss_func=recon_loss_func, beta_dyn_rec=beta_dyn_rec,
-                                             num_static=num_static_frames, noisy=noisy)
+                # compute the mixture of gaussians (MOG) prior loss
+                all_losses = model.calc_mog_elbo(x, 
+                                             model_output, 
+                                             warmup=(epoch < warmup_epoch), 
+                                             beta_kl=beta_kl,
+                                             beta_dyn=beta_dyn, 
+                                             beta_rec=beta_rec, 
+                                             kl_balance=kl_balance,
+                                             dynamic_discount=discount, 
+                                             beta_dyn_rec=beta_dyn_rec,
+                                             num_static=num_static_frames, 
+                                             noisy=noisy)
+                
+           
+            
+                # all_losses = model.calc_elbo(x, 
+                #                              model_output, 
+                #                              warmup=(epoch < warmup_epoch), 
+                #                              beta_kl=beta_kl,
+                #                              beta_dyn=beta_dyn, 
+                #                              beta_rec=beta_rec, 
+                #                              kl_balance=kl_balance,
+                #                              dynamic_discount=discount, 
+                #                              recon_loss_type=recon_loss_type,
+                #                              recon_loss_func=recon_loss_func, 
+                #                              beta_dyn_rec=beta_dyn_rec,
+                #                              num_static=num_static_frames, 
+                #                              noisy=noisy)
             else:
                 discount_factor = 0.0
                 discount = discount_factor * torch.ones(size=(timestep_horizon,), device=x.device)
 
-                all_losses = model.calc_elbo_static(x, model_output, warmup=(epoch < warmup_epoch),
+                all_losses = model.calc_elbo_static(x, 
+                                                    model_output, 
+                                                    warmup=(epoch < warmup_epoch),
                                                     beta_kl=beta_kl,
-                                                    beta_dyn=beta_dyn, beta_rec=beta_rec, kl_balance=kl_balance,
-                                                    dynamic_discount=discount, recon_loss_type=recon_loss_type,
-                                                    recon_loss_func=recon_loss_func, noisy=noisy)
+                                                    beta_dyn=beta_dyn, 
+                                                    beta_rec=beta_rec, 
+                                                    kl_balance=kl_balance,
+                                                    dynamic_discount=discount,
+                                                      recon_loss_type=recon_loss_type,
+                                                    recon_loss_func=recon_loss_func, 
+                                                    noisy=noisy)
 
+            
             loss = all_losses['loss']
             optimizer.zero_grad()
             loss.backward()

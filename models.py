@@ -1722,6 +1722,10 @@ class ObjectDynamicsDLP(nn.Module):
         use_correlation_heatmaps: use correlation heatmaps for tracking
         filtering heuristic: filtering heuristic to filter prior keypoints,['distance', 'variance', 'random', 'none']
         """
+        # FIXME Why do we specify the std deviation of the priors for offset and scale? Why not just N(0,1)
+        # FIXME What is 'obj_on'?
+        # FIXME read in ddlp paper why beta distribution is good
+
         self.image_size = image_size
         self.sigma = sigma
         self.dropout = dropout
@@ -1788,6 +1792,7 @@ class ObjectDynamicsDLP(nn.Module):
 
         #initalize loss information
         self.kl_loss_func = ChamferLossKL(use_reverse_kl=False)
+        self.recon_loss_type = recon_loss_type
         if recon_loss_type == "vgg":
             self.recon_loss_func = VGGDistance()
         else:
@@ -2646,7 +2651,8 @@ class ObjectDynamicsDLP(nn.Module):
                      batch_size,
                      num_static,
                      balance,
-                     discount):
+                     discount,
+                     bg=False):
         mu_posterior = mu_posterior.reshape(
             batch_size, 
             self.timestep_horizon + 1, 
@@ -2663,12 +2669,19 @@ class ObjectDynamicsDLP(nn.Module):
         logvar_prior = logvar_prior[:, num_static - 1:].reshape(-1,logvar_prior.shape[
                                                                                                  -1])
         
+        # FIXME unclear on loss function for dynamics module
+        # why not also use chamfer KL?
+        # when we calc KL, what is mu_o and logvar_o? 
         loss_kl_dyn = calc_kl(mu=mu_posterior,
                                  logvar=logvar_posterior,
                                  mu_o=mu_prior,
                                  logvar_o=logvar_prior,
                                  reduce='none', balance=balance)
-        loss_kl_dyn = (loss_kl_dyn.view(batch_size, -1, self.n_kp_enc)).sum(-1)
+        if bg:
+            loss_kl_dyn = loss_kl_dyn.view(batch_size, -1)
+        else:
+            loss_kl_dyn = (loss_kl_dyn.view(batch_size, -1, self.n_kp_enc)).sum(-1)
+
         loss_kl_dyn = (loss_kl_dyn * discount[None, :]).sum(-1).mean()
         return loss_kl_dyn
 
@@ -2741,6 +2754,7 @@ class ObjectDynamicsDLP(nn.Module):
         # position
 
         # posteriors for postion
+
         loss_kl_kp_dyn = self.calc_pint_kl(
             mu_posterior = mu_tot,
             logvar_posterior=logvar_tot,
@@ -2748,6 +2762,7 @@ class ObjectDynamicsDLP(nn.Module):
             logvar_prior=logvar_dyn,
             batch_size=batch_size,
             num_static=num_static,
+            balance=balance,
             discount = discount
         )
 
@@ -2759,6 +2774,7 @@ class ObjectDynamicsDLP(nn.Module):
             logvar_prior=logvar_scale_dyn,
             batch_size=batch_size,
             num_static=num_static,
+            balance=balance,
             discount = discount
         )
 
@@ -2770,6 +2786,7 @@ class ObjectDynamicsDLP(nn.Module):
             logvar_prior=logvar_depth_dyn,
             batch_size=batch_size,
             num_static=num_static,
+            balance=balance,
             discount = discount
         )
 
@@ -2782,6 +2799,7 @@ class ObjectDynamicsDLP(nn.Module):
             logvar_prior=logvar_features_dyn,
             batch_size=batch_size,
             num_static=num_static,
+            balance=balance,
             discount = discount
         )
 
@@ -2794,7 +2812,9 @@ class ObjectDynamicsDLP(nn.Module):
             logvar_prior=logvar_bg_dyn,
             batch_size=batch_size,
             num_static=num_static,
-            discount = discount
+            balance=balance,
+            discount = discount,
+            bg=True
         )
 
      
@@ -2810,12 +2830,12 @@ class ObjectDynamicsDLP(nn.Module):
 
                    
     def LDLP(self,
-                     mu,
-                     obj_on_a,
-                     obj_on_b,
-                     kp_p,
-                     mu_offset,
-                     logvar_offset,
+             mu,
+             obj_on_a,
+             obj_on_b,
+             kp_p,
+             mu_offset,
+             logvar_offset,
                      mu_depth,
                      logvar_depth,
                      mu_scale,
@@ -2824,9 +2844,6 @@ class ObjectDynamicsDLP(nn.Module):
                      logvar_features,
                      mu_bg,
                      logvar_bg,
-                     logvar_kp,
-                     logvar_offset_p,
-                     logvar_scale_p,
                      obj_on,
                      batch_size,
                      num_static,
@@ -2840,9 +2857,10 @@ class ObjectDynamicsDLP(nn.Module):
          to calculate the KL-divergence term (similarly to Wu et al.
          2022, we set τ = 4 in all our experiments).
         """
-        # TODO refactor to accept as parameters what is needed for an arbitrary KL calculation
-        
+        # FIXME could you explain how burn in frames work ?
+
         # --- define priors ---- 
+       
         # encourage objects to be 'on' during warmup
         obj_on_a_prior = torch.tensor(0.2, device=obj_on_a.device) if (warmup or noisy) else self.obj_on_a_p
         obj_on_b_prior = torch.tensor(0.1, device=obj_on_b.device) if (warmup or noisy) else self.obj_on_b_p
@@ -2859,6 +2877,10 @@ class ObjectDynamicsDLP(nn.Module):
             self.timestep_horizon + 1, 
             *kp_p.shape[1:])[:,
                  :num_static]  # [bs, t, n_kp_prior, 2]
+        
+        
+
+
         mu_offset_0 = mu_offset.reshape(batch_size, self.timestep_horizon + 1, *mu_offset.shape[1:])[:,
                       :num_static]  # [bs, t, n_kp, 2]
         logvar_offset_0 = logvar_offset.reshape(batch_size, self.timestep_horizon + 1, *logvar_offset.shape[1:])[:,
@@ -2906,6 +2928,11 @@ class ObjectDynamicsDLP(nn.Module):
                                         self.timestep_horizon + 1, 
                                         *logvar_bg.shape[1:])[:, :num_static]
         # note: bg latent dim = a single particle's latent dim
+
+        warmup_logvar = torch.log(torch.tensor(0.1 ** 2))
+        logvar_kp = self.logvar_kp.expand_as(mu_p_0)
+        logvar_offset_p = warmup_logvar if (warmup or noisy) else self.logvar_offset_p
+        logvar_scale_p = warmup_logvar if (warmup or noisy) else self.logvar_scale_p
 
 
         # --- kl-divergence for t <= tau --- #
@@ -3042,13 +3069,19 @@ class ObjectDynamicsDLP(nn.Module):
                   static_scale = 1, 
                   dyn_scale = 1 ):
         # discount for future steps
+        #FIXME don't see explicit discussion of discount for long horizon 
+        # in the paper, could you explain high level motivation here?
         if dynamic_discount is None:
             discount = torch.ones(size=(self.timestep_horizon - num_static + 1,), device=x.device)
         else:
             discount = dynamic_discount[:self.timestep_horizon - num_static + 1]
 
+        #compute batch size 
+        batch_size = x.shape[0]
         # compute the reconstruction loss 
         # for all frames 
+
+        #FIXME why peak signal to nosie ratio as a metric?
         loss_rec, psnr = self.LREC(
             x,
             model_output=model_output,
@@ -3062,8 +3095,22 @@ class ObjectDynamicsDLP(nn.Module):
         # using the Chamfer-KL loss 
         # with standard priors 
         loss_kl, loss_kl_depth, loss_kl_scale, loss_kl_obj_on, loss_kl_feat,obj_on_l1,loss_kl_kp = self.LDLP(
-            model_output=model_output,
-            batch_size=x.shape[0],
+            mu = model_output['mu'],
+            obj_on_a = model_output['obj_on_a'],
+            obj_on_b=model_output['obj_on_b'],
+            kp_p=model_output['kp_p'],
+            mu_offset=model_output['mu_offset'],
+            logvar_offset=model_output['logvar_offset'],
+            mu_depth=model_output['mu_depth'],
+            logvar_depth=model_output['logvar_depth'],
+            mu_scale=model_output['mu_scale'],
+            logvar_scale=model_output['logvar_scale'],
+            mu_features=model_output['mu_features'],
+            logvar_features=model_output['logvar_features'],
+            mu_bg=model_output['mu_bg'],
+            logvar_bg=model_output['logvar_bg'],
+            obj_on = model_output['obj_on'],
+            batch_size=batch_size,
             num_static=num_static,
             kl_balance=kl_balance,
             warmup=warmup,
@@ -3073,13 +3120,15 @@ class ObjectDynamicsDLP(nn.Module):
         # compute loss for 'normal' frames (t >= Tau) 
         # using PINT priors 
         # with KL divergence (instead of Chamfer KL)
+        mu_tot = model_output['z_base'].detach() + model_output['mu_offset']
+
         loss_kl_dyn = self.LDYN(
             obj_on_a = model_output['obj_on_a'],
                      obj_on_b=model_output['obj_on_b'],
                      obj_on_a_dyn=model_output['obj_on_a_dyn'],
                      obj_on_b_dyn=model_output['obj_on_b_dyn'],
-                     mu_tot=model_output['mu_tot'],
-                     logvar_tot=model_output['logvar_tot'],
+                     mu_tot=mu_tot,
+                     logvar_tot=model_output['logvar_offset'],
                      mu_dyn=model_output['mu_dyn'],
                      logvar_dyn=model_output['logvar_dyn'],
                      mu_scale=model_output['mu_scale'],
@@ -3098,7 +3147,7 @@ class ObjectDynamicsDLP(nn.Module):
                      logvar_bg=model_output['logvar_bg'],
                      mu_bg_dyn=model_output['mu_bg_dyn'],
                      logvar_bg_dyn=model_output['logvar_bg_dyn'],
-                     batch_size=model_output['batch_size'],
+                     batch_size=batch_size,
                      num_static=num_static,
                      balance=balance,
                      discount=discount
@@ -3271,6 +3320,19 @@ class ObjectDynamicsDLP(nn.Module):
         mu_scale_0 = mu_scale.reshape(batch_size, timestep_horizon + 1, *mu_scale.shape[1:])[:,
                      :num_static]  # [bs, t, n_kp, 2]
         logvar_scale_0 = logvar_scale.reshape(batch_size, timestep_horizon + 1, *logvar_scale.shape[1:])[:, :num_static]
+        
+        obj_on_a_0 = obj_on_a.reshape(
+            batch_size, 
+            self.timestep_horizon  + 1, 
+            *obj_on_a.shape[1:])[:,
+                     :num_static]  # [bs, t, n_kp]
+        obj_on_b_0 = obj_on_b.reshape(
+            batch_size, 
+              self.timestep_horizon + 1, 
+              *obj_on_b.shape[1:])[:,
+                     :num_static]  # [bs, t, n_kp]
+        
+        
         obj_on_a_post = obj_on_a.reshape(batch_size, timestep_horizon + 1, *obj_on_a.shape[1:])[:,
                      :num_static]  # [bs, t, n_kp]
         obj_on_b_post = obj_on_b.reshape(batch_size, timestep_horizon + 1, *obj_on_b.shape[1:])[:,
