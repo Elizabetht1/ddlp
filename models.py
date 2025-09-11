@@ -11,12 +11,11 @@ import torch.nn as nn
 from modules.modules import KeyPointCNNOriginal, VariationalKeyPointPatchEncoder, CNNDecoder, \
     ObjectDecoderCNN, FCToCNN
 
-from modules.modules import ParticleAttributeEncoder, ParticleFeaturesEncoder, ParticleFilterMixer
+from modules.modules import VGMDecoder,VGMEncoder,ParticleAttributeEncoder, ParticleFeaturesEncoder, ParticleFilterMixer
 from modules.dynamics_modules import DynamicsDLP
 # util functions
 from utils.util_func import reparameterize, create_masks_fast, spatial_transform, calc_model_size
-from utils.loss_functions import ChamferLossKL, calc_kl, calc_reconstruction_loss, VGGDistance, calc_kl_beta_dist
-
+from utils.loss_functions import calc_gmvae_loss, ChamferLossKL, calc_kl, calc_reconstruction_loss, VGGDistance, calc_kl_beta_dist
 
 class FgDLP(nn.Module):
     def __init__(self, 
@@ -87,11 +86,17 @@ class FgDLP(nn.Module):
         self.filtering_heuristic = filtering_heuristic
 
         # prior
-        self.prior = VariationalKeyPointPatchEncoder(cdim=cdim, channels=prior_channels, image_size=image_size,
-                                                     n_kp=n_kp, kp_range=self.kp_range,
+        self.prior = VariationalKeyPointPatchEncoder(cdim=cdim, 
+                                                     channels=prior_channels, 
+                                                     image_size=image_size,
+                                                     n_kp=n_kp, 
+                                                     kp_range=self.kp_range,
                                                      patch_size=patch_size,
-                                                     pad_mode=pad_mode, sigma=sigma, dropout=dropout,
-                                                     learnable_logvar=False, learned_feature_dim=0,
+                                                     pad_mode=pad_mode, 
+                                                     sigma=sigma, 
+                                                     dropout=dropout,
+                                                     learnable_logvar=False, 
+                                                     learned_feature_dim=0,
                                                      use_resblock=self.use_resblock)
 
         # posterior encoder
@@ -104,14 +109,20 @@ class FgDLP(nn.Module):
         else:
             self.particle_mixer = nn.Identity()
         # attribute encoder - anchor (z_a), offset (z_o), scale (z_s), transparency (z_t) and depth (z_d)
-        self.particle_attribute_enc = ParticleAttributeEncoder(anchor_size=anchor_s, image_size=image_size,
-                                                               margin=0, ch=cdim,
+        self.attribute_cp_enc = VGMEncoder()
+        self.attribute_cp_dec = VGMDecoder()
+        self.particle_attribute_enc = ParticleAttributeEncoder(anchor_size=anchor_s, 
+                                                               image_size=image_size,
+                                                               margin=0, 
+                                                               ch=cdim,
                                                                kp_activation=kp_activation,
                                                                use_resblock=self.use_resblock,
-                                                               max_offset=1.0, cnn_channels=prior_channels,
+                                                               max_offset=1.0, 
+                                                               cnn_channels=prior_channels,
                                                                use_correlation_heatmaps=use_correlation_heatmaps,
                                                                enable_attn=self.enable_enc_attn, attn_dropout=0.0)
         # appearance encoder - visual features encoder (z_f)
+        self.particle_attribute_conditional_prior = GMCondPrior()
         self.particle_features_enc = ParticleFeaturesEncoder(anchor_s, learned_feature_dim,
                                                              image_size,
                                                              cnn_channels=prior_channels,
@@ -281,13 +292,25 @@ class FgDLP(nn.Module):
         else:
             z_features = reparameterize(mu_features, logvar_features)
 
+        ## encode the posterior p(w | x) for GMVAE 
+        # attributes 
+        mu_wpost_a, var_wpost_a  = self.attribute_cp_enc(x)
+
+        # sample from the posterior p (w | x) using the reparametrization trick
+        w_a = reparameterize(mu_wpost_a, var_wpost_a)
+
         encode_dict = {'mu': mu, 'logvar': logvar, 'z_base': z_base, 'z': z, 'kp_heatmap': kp_heatmap,
                        'mu_features': mu_features, 'logvar_features': logvar_features, 'z_features': z_features,
                        'obj_on_a': obj_on_a, 'obj_on_b': obj_on_b, 'obj_on': z_obj_on,
                        'mu_depth': mu_depth, 'logvar_depth': logvar_depth, 'z_depth': z_depth,
                        'cropped_objects': cropped_objects,
                        'mu_scale': mu_scale, 'logvar_scale': logvar_scale, 'z_scale': z_scale,
-                       'mu_offset': mu_offset, 'logvar_offset': logvar_offset, 'z_offset': z_offset}
+                       'mu_offset': mu_offset, 
+                       'logvar_offset': logvar_offset, 
+                       'z_offset': z_offset,
+                       'mu_wpost_a': mu_wpost_a,
+                       'var_wpost_a': var_wpost_a,
+                       'w_a': w_a}
         return encode_dict
 
     def encode_prior(self, x, x_prior=None, filtering_heuristic='variance', k=None):
@@ -388,13 +411,21 @@ class FgDLP(nn.Module):
                                                                                         z_depth=z_depth)
         return dec_objects, dec_objects_trans, alpha_masks, bg_mask
 
-    def decode_all(self, z, z_features, obj_on, z_depth=None, noisy=False, z_scale=None):
+    def decode_all(self, z, z_features, obj_on, w_a, z_depth=None, noisy=False, z_scale=None):
         # a wrapper function to decode latent particles into and RGB image (no bg)
         object_dec_out = self.decode_objects(z, z_features, obj_on, noisy=noisy, z_depth=z_depth, z_scale=z_scale)
         dec_objects, dec_objects_trans, alpha_masks, bg_mask = object_dec_out
 
-        decoder_out = {'dec_objects': dec_objects, 'dec_objects_trans': dec_objects_trans,
-                       'bg_mask': bg_mask, 'alpha_masks': alpha_masks}
+        ## decode the parameters of the distribution p( * |w,y)
+        mu_beta_a, var_beta_a = self.attribute_cp_dec(w_a)
+
+
+        decoder_out = {'dec_objects': dec_objects, 
+                       'dec_objects_trans': dec_objects_trans,
+                       'bg_mask': bg_mask, 
+                       'alpha_masks': alpha_masks,
+                       'mu_beta_a': mu_beta_a,
+                       'var_beta_a': var_beta_a}
 
         return decoder_out
 
@@ -442,6 +473,8 @@ class FgDLP(nn.Module):
         dec_objects_trans = decoder_out['dec_objects_trans']
         bg_mask = decoder_out['bg_mask']
         alpha_masks = decoder_out['alpha_masks']
+        beta_mu_a = decoder_out['mu_beta_a']
+        beta_var_a = decoder_out['var_beta_a']
 
         output_dict = {}
         output_dict['kp_p'] = kp_p
@@ -468,6 +501,10 @@ class FgDLP(nn.Module):
         output_dict['logvar_scale'] = logvar_scale
         output_dict['z_scale'] = z_scale
         output_dict['alpha_masks'] = alpha_masks
+
+        # parameters of the prior 
+        output_dict['beta_mu_a'] = beta_mu_a
+        output_dict['beta_var_a'] = beta_var_a
 
         return output_dict
 
@@ -1768,13 +1805,25 @@ class ObjectDynamicsDLP(nn.Module):
         self.register_buffer('obj_on_b_p', torch.tensor(obj_on_beta))
 
         # foreground module
-        self.fg_module = FgDLP(cdim=cdim, enc_channels=enc_channels, prior_channels=prior_channels,
-                               image_size=image_size, n_kp=n_kp, pad_mode=pad_mode,
-                               sigma=sigma, dropout=dropout, patch_size=patch_size, n_kp_enc=n_kp_enc,
-                               n_kp_prior=n_kp_prior, learned_feature_dim=learned_feature_dim, kp_range=kp_range,
-                               kp_activation=kp_activation, anchor_s=anchor_s,
-                               use_resblock=self.use_resblock, use_correlation_heatmaps=use_correlation_heatmaps,
-                               enable_enc_attn=self.enable_enc_attn, filtering_heuristic=filtering_heuristic)
+        self.fg_module = FgDLP(cdim=cdim, 
+                               enc_channels=enc_channels, 
+                               prior_channels=prior_channels,
+                               image_size=image_size, 
+                               n_kp=n_kp, 
+                               pad_mode=pad_mode,
+                               sigma=sigma, 
+                               dropout=dropout, 
+                               patch_size=patch_size, 
+                               n_kp_enc=n_kp_enc,
+                               n_kp_prior=n_kp_prior, 
+                               learned_feature_dim=learned_feature_dim, 
+                               kp_range=kp_range,
+                               kp_activation=kp_activation, 
+                               anchor_s=anchor_s,
+                               use_resblock=self.use_resblock, 
+                               use_correlation_heatmaps=use_correlation_heatmaps,
+                               enable_enc_attn=self.enable_enc_attn, 
+                               filtering_heuristic=filtering_heuristic)
         # background module
         self.bg_module = BgDLP(cdim=cdim, enc_channels=enc_channels, image_size=image_size, pad_mode=pad_mode,
                                dropout=dropout, learned_feature_dim=self.bg_learned_feature_dim, n_kp_enc=n_kp_enc,
@@ -2292,7 +2341,11 @@ class ObjectDynamicsDLP(nn.Module):
             dec_objects_transs = dec_objects_transs.view(-1, timestep_horizon, *dec_objects_transs.shape[1:])
             alpha_maskss = alpha_maskss.view(-1, timestep_horizon, *alpha_maskss.shape[1:])
 
-        output_dict = {'kp_p': kp_ps, 'mu': mus, 'logvar': logvars, 'z_base': z_bases, 'z': zs, 'mu_offset': mu_offsets,
+        output_dict = {'kp_p': kp_ps, 
+                       'mu': mus, 
+                       'logvar': logvars, 
+                       'z_base': z_bases, 
+                        'z': zs, 'mu_offset': mu_offsets,
                        'logvar_offset': logvar_offsets, 'mu_features': mu_featuress,
                        'logvar_features': logvar_featuress, 'z_features': z_featuress, 'bg_mask': bg_masks,
                        'cropped_objects_original': cropped_objectss, 'obj_on_a': obj_on_as, 'obj_on_b': obj_on_bs,
@@ -2533,6 +2586,10 @@ class ObjectDynamicsDLP(nn.Module):
         dec_objects_trans = fg_dict['dec_objects']
         alpha_masks = fg_dict['alpha_masks']
 
+        ## extract decoded conditional prior 
+        beta_mu_a = fg_dict['beta_mu_a']
+        beta_var_a = fg_dict['beta_var_a']
+
         if bg_masks_from_fg:
             bg_enc_mask = bg_mask
         else:
@@ -2641,83 +2698,15 @@ class ObjectDynamicsDLP(nn.Module):
         output_dict['mu_bg_dyn'] = mu_bg_features_dyn
         output_dict['logvar_bg_dyn'] = logvar_bg_features_dyn
 
+
+        ## conditional prior information 
+        output_dict['beta_mu_a'] = fg_dict['beta_mu_a']
+        output_dict['beta_var_a'] = fg_dict['beta_var_a']
+
         return output_dict
 
-    def mc_mog_kl(self,
-               z,
-               mu_theta,
-               var_theta,
-               mu_beta,
-               var_beta,
-               pi):
-        """
-        Perform a MC sample of Eq(w|y)p(z|x,w) [KLqφx(x|y)||pβ(x|w, z)]
-
-        z = latent representation 
-        K = number of clusters in the mixture (default 16)
-        mu_prior_conditional
-        var_prior_conditional
-        pi = mixing probability (shape is K x 1)
     
-        """
-
-        # ----- collect priors ----- #
-        # the prior of the latent w is N(0,I)
-
-        # the prior for y is _
-
-        # the prior for 
-
-
-        # TODO confirm this creates K independent
-        # normals given vectors of length K
-        npdf= torch.distributions.normal.Normal(loc=mu_beta,
-                                                     scale = torch.sqrt(var_beta))
-            
-        E_j = pi * npdf.log_prob(z).exp()
-        denom = torch.sum(E_j)
-
-        prob_z = E_j / denom
-
-        # ----- compute KL divergence per cluster ---- #
-        KL = calc_kl(mu=mu_theta,
-            var=var_theta,
-            mu_o=mu_beta, 
-            var_o=var_beta,
-            reduce='none')
-        
-        return torch.sum(prob_z*KL) 
     
-    def mog_kl(self,
-               mu_post,
-               var_post,
-               pi=None,
-               M=10,
-               ):
-        
-        K = mu_post.shape[0]
-        ## TODO figure out what kind of distribution this is 
-        dist_post = torch.distributions.normal.Normal(
-            loc=mu_post,
-            scale = torch.sqrt(var_post))
-        
-        # draw M samples from the normal distribution
-        z = torch.normal(mean=mu_post.repeat(M),
-                         std=torch.sqrt(var_post).repeat(M))
-
-        # draw M the prior of w
-        w = torch.normal(mean = torch.zeors(M),
-                         std = torch.ones(M))
-        
-        # compute the forward pass of the model through w
-        mu_beta, var_beta = self.forward(w)
-
-        if not pi:
-            pi = torch.ones(K).pow(-1)
-
-        return self.mc_mog_kl(z,mu_post,var_post,mu_beta,var_beta,pi)
-
-
 
 
     def calc_pint_kl(self,
@@ -2911,10 +2900,12 @@ class ObjectDynamicsDLP(nn.Module):
              obj_on_a,
              obj_on_b,
              kp_p,
+             beta_mu_a,
+             beta_var_a,
              mu_offset,
-             logvar_offset,
-                     mu_depth,
-                     logvar_depth,
+            logvar_offset,
+             mu_depth,
+            logvar_depth,
                      mu_scale,
                      logvar_scale,
                      mu_features,
@@ -2922,6 +2913,8 @@ class ObjectDynamicsDLP(nn.Module):
                      mu_bg,
                      logvar_bg,
                      obj_on,
+                     mu_w_enc_fg, 
+                    logvar_w_enc_fg,
                      batch_size,
                      num_static,
                      kl_balance=0.001,
@@ -3012,7 +3005,144 @@ class ObjectDynamicsDLP(nn.Module):
         logvar_scale_p = warmup_logvar if (warmup or noisy) else self.logvar_scale_p
 
 
+        # # --- kl-divergence for t <= tau --- #
+        # ...existing code...
         # --- kl-divergence for t <= tau --- #
+        """
+        GMVAE requires three KL loss terms 
+        1) conditional prior 
+
+        2) w prior 
+
+        3) z prior 
+        """
+
+        # Prepare burn-in (t < tau) per-particle latents and (optional) w-encodings.
+        # In the paper 'x' corresponds to the continuous latent; in this implementation 'x' == concatenated z (offset, scale, features, depth).
+        bs = mu_features_0.shape[0]
+        t_burn = mu_features_0.shape[1]
+        K = self.n_kp_enc
+        device = mu_features_0.device
+
+        # build mu_x / logvar_x by concatenating the continuous per-particle latents (offset, scale, features, depth)
+        # shapes: [bs, t_burn, K, dim_*]
+        mu_x_0 = torch.cat([mu_offset_0, mu_scale_0, mu_features_0, mu_depth_0], dim=-1)
+        logvar_x_0 = torch.cat([logvar_offset_0, logvar_scale_0, logvar_features_0, logvar_depth_0], dim=-1)
+
+        # flatten to batch dimension expected by calc_gmvae_loss: B' = bs * t_burn * K
+        mu_x = mu_x_0.reshape(-1, mu_x_0.shape[-1])         # [B', D_x]
+        logvar_x = logvar_x_0.reshape(-1, logvar_x_0.shape[-1])  # [B', D_x]
+
+        # If encodings for w (mu_w_enc_fg / logvar_w_enc_fg) are provided, split them per-feature.
+        # Expected per-particle layout: [offset | scale | features | depth] (concatenated).
+        if (mu_w_enc_fg is not None) and (logvar_w_enc_fg is not None):
+            # reshape to [bs, t_burn, K, dim_w]
+            mu_w_full = mu_w_enc_fg.reshape(batch_size, self.timestep_horizon + 1, *mu_w_enc_fg.shape[1:])[:, :num_static]
+            mu_w_full = mu_w_full.reshape(-1, K, mu_w_full.shape[-1])  # [bs * t_burn, K, dim_w]
+            logvar_w_full = logvar_w_enc_fg.reshape(batch_size, self.timestep_horizon + 1, *logvar_w_enc_fg.shape[1:])[:, :num_static]
+            logvar_w_full = logvar_w_full.reshape(-1, K, logvar_w_full.shape[-1])
+
+            # determine expected component sizes from posterior latents
+            dim_off = mu_offset_0.shape[-1]
+            dim_scale = mu_scale_0.shape[-1]
+            dim_feat = mu_features_0.shape[-1]
+            dim_depth = mu_depth_0.shape[-1]
+            expected = dim_off + dim_scale + dim_feat + dim_depth
+            actual = mu_w_full.shape[-1]
+            if actual < expected:
+                raise RuntimeError(f"mu_w_enc_fg has {actual} dims, expected >= {expected} (offset,scale,feat,depth).")
+
+            # slice per-feature
+            s0 = 0
+            s1 = s0 + dim_off
+            s2 = s1 + dim_scale
+            s3 = s2 + dim_feat
+            s4 = s3 + dim_depth
+
+            mu_w_offset = mu_w_full[..., s0:s1].reshape(-1, dim_off)   # [B'*K?, dim_off] -> will match mu_offset flattened
+            mu_w_scale  = mu_w_full[..., s1:s2].reshape(-1, dim_scale)
+            mu_w_feat   = mu_w_full[..., s2:s3].reshape(-1, dim_feat)
+            mu_w_depth  = mu_w_full[..., s3:s4].reshape(-1, dim_depth)
+
+            logvar_w_offset = logvar_w_full[..., s0:s1].reshape(-1, dim_off)
+            logvar_w_scale  = logvar_w_full[..., s1:s2].reshape(-1, dim_scale)
+            logvar_w_feat   = logvar_w_full[..., s2:s3].reshape(-1, dim_feat)
+            logvar_w_depth  = logvar_w_full[..., s3:s4].reshape(-1, dim_depth)
+
+            # full w encoding per-particle as required by calc_gmvae_loss: [B', D_w]
+            mu_w = mu_w_full.reshape(-1, mu_w_full.shape[-1])
+            logvar_w = logvar_w_full.reshape(-1, logvar_w_full.shape[-1])
+        else:
+            # fallback: build a simple w-encoding from posterior statistics (mean/var of mu_x)
+            mu_w = mu_x.clone()
+            logvar_w = logvar_x.clone()
+            # provide per-feature fallbacks so later calc_kl calls do not break
+            mu_w_offset = mu_x[:, :mu_offset_0.shape[-1]]
+            mu_w_scale = mu_x[:, mu_offset_0.shape[-1]:mu_offset_0.shape[-1] + mu_scale_0.shape[-1]]
+            mu_w_feat = mu_x[:, mu_offset_0.shape[-1] + mu_scale_0.shape[-1]:
+                                mu_offset_0.shape[-1] + mu_scale_0.shape[-1] + mu_features_0.shape[-1]]
+            mu_w_depth = mu_x[:, -mu_depth_0.shape[-1]:]
+
+            logvar_w_offset = logvar_x[:, :mu_w_offset.shape[-1]]
+            logvar_w_scale = logvar_x[:, mu_w_offset.shape[-1]:mu_w_offset.shape[-1] + mu_w_scale.shape[-1]]
+            logvar_w_feat = logvar_x[:, mu_w_offset.shape[-1] + mu_w_scale.shape[-1]:
+                                        mu_w_offset.shape[-1] + mu_w_scale.shape[-1] + mu_w_feat.shape[-1]]
+            logvar_w_depth = logvar_x[:, -mu_w_depth.shape[-1]:]
+
+        # Monte-Carlo samples for calc_gmvae_loss: repeat for M*2 to match the implementation in utils.loss_functions
+        M = 10
+        mc_w_samples = reparameterize(mu_w.repeat(M * 2, 1), logvar_w.repeat(M * 2, 1))
+        mc_x_samples = reparameterize(mu_x.repeat(M * 2, 1), logvar_x.repeat(M * 2, 1))
+
+        # decoder_beta expected by calc_gmvae_loss is the network that maps w -> mixture params (VGMDecoder)
+        decoder_beta = getattr(self.fg_module, "attribute_cp_dec", None)
+        if decoder_beta is None:
+            raise RuntimeError("LDLP: decoder_beta (attribute_cp_dec) not found on fg_module.")
+
+        # y (observed) for calc_gmvae_loss -- use concatenated per-particle z (mu_x) as the observed placeholder
+        y_burn = mu_x
+
+        # Call the black-box GMVAE loss for burn-in frames only.
+        conditional_prior_loss, w_prior_loss, z_prior_loss = calc_gmvae_loss(
+            y=y_burn,
+            mc_w_samples=mc_w_samples,
+            mc_x_samples=mc_x_samples,
+            mu_x=mu_x,
+            logvar_x=logvar_x,
+            mu_w=mu_w,
+            logvar_w=logvar_w,
+            decoder_beta=decoder_beta,
+            M=M,
+            K=K
+        )
+        
+        # --- continue with the remaining static KL terms --- #
+        # ...existing
+        # """
+        # GMVAE requires three KL loss terms 
+        # 1) conditional prior 
+
+        # 2) w prior 
+
+        # 3) z prior 
+        # """
+
+        # # compute the conditional prior by drawing MC sample sfrom q(z|y)
+        # # where z is a continuous variable variable 
+        
+        # ## compute this for each prior 
+        # conditional_prior_loss, w_prior_loss, z_prior_loss = calc_gmvae_loss(
+        #     mu_x=mu_offset, ## variational factors for what GMVAE paper calls x,w 
+        #     var_x=logvar_offset,
+        #     mu_w=mu_w_enc_fg,
+        #     var_w=logvar_w_enc_fg,
+        #     mu_beta=beta_mu_a,
+        #     var_beta=beta_var_a,
+        #     M= 10 # number of monte carlo samples to collect
+        # )
+        
+    
+
         # kl-divergence and priors
         mu_prior = mu_p_0.reshape(-1, *mu_p_0.shape[2:])  # [bs * t, n_kp_prior, 2]
         logvar_prior = logvar_kp.reshape(-1, 
@@ -3027,26 +3157,44 @@ class ObjectDynamicsDLP(nn.Module):
         loss_kl_kp_base = loss_kl_kp_base.view(-1, num_static).sum(-1).mean()
         loss_kl_kp_base = loss_kl_kp_base.mean()
 
-        loss_kl_kp_offset = calc_kl(logvar_offset_0.reshape(-1, logvar_offset_0.shape[-1]),
-                                    mu_offset_0.reshape(-1, mu_offset_0.shape[-1]), 
-                                    logvar_o=logvar_offset_p,
+        # loss_kl_kp_offset = calc_kl(logvar_offset_0.reshape(-1, logvar_offset_0.shape[-1]),
+        #                             mu_offset_0.reshape(-1, mu_offset_0.shape[-1]), 
+        #                             logvar_o=logvar_offset_p,
+        #                             reduce='none')
+        
+        # _ET_ updates for conditional prior 
+        loss_kl_kp_offset = calc_kl(logvar=logvar_offset_0.reshape(-1, logvar_offset_0.shape[-1]),
+                                    mu=mu_offset_0.reshape(-1, mu_offset_0.shape[-1]), 
+                                    mu_o=mu_w_offset,
+                                    logvar_o=logvar_w_offset,
                                     reduce='none')
+
         loss_kl_kp_offset = (loss_kl_kp_offset.view(-1, num_static, self.n_kp_enc)).sum(dim=(-2, -1)).mean()
         # loss_kl_kp = loss_kl_kp_base + loss_kl_kp_offset
         loss_kl_kp = 0.5 * kl_balance * loss_kl_kp_base + loss_kl_kp_offset
         # loss_kl_kp = loss_kl_kp_base + kl_balance * loss_kl_kp_offset
 
         # depth
-        loss_kl_depth = calc_kl(logvar_depth_0.reshape(-1, logvar_depth_0.shape[-1]),
-                                mu_depth_0.reshape(-1, mu_depth_0.shape[-1]), reduce='none')
+        # _ET_ updates for conditional prior 
+        loss_kl_depth = calc_kl(logvar=logvar_depth_0.reshape(-1, logvar_depth_0.shape[-1]),
+                                mu=mu_depth_0.reshape(-1, mu_depth_0.shape[-1]), 
+                                mu_o = mu_w_depth,
+                                logvar_o=mu_w_depth,
+                                reduce='none')
         loss_kl_depth = (loss_kl_depth.view(-1, num_static, self.n_kp_enc)).sum(dim=(-2, -1)).mean()
 
         # scale
         # assume sigmoid activation on z_scale
+        # _ET_ updates for conditional prior 
+        # loss_kl_scale = calc_kl(logvar_scale_0.reshape(-1, logvar_scale_0.shape[-1]),
+        #                         mu_scale_0.reshape(-1, mu_scale_0.shape[-1]),
+        #                         mu_o=self.mu_scale_prior, 
+        #                         logvar_o=logvar_scale_p,
+        #                         reduce='none')
         loss_kl_scale = calc_kl(logvar_scale_0.reshape(-1, logvar_scale_0.shape[-1]),
                                 mu_scale_0.reshape(-1, mu_scale_0.shape[-1]),
-                                mu_o=self.mu_scale_prior, 
-                                logvar_o=logvar_scale_p,
+                                mu_o=mu_w_scale, 
+                                logvar_o=logvar_w_scale,
                                 reduce='none')
         loss_kl_scale = (loss_kl_scale.view(-1, num_static, self.n_kp_enc)).sum(dim=(-2, -1)).mean()
 
@@ -3058,8 +3206,15 @@ class ObjectDynamicsDLP(nn.Module):
         obj_on_l1 = torch.abs(obj_on).sum(-1).mean()  # just to get an idea how many particles are turned on
 
         # features
+        # _ET_ updates for conditional prior 
+        # loss_kl_feat = calc_kl(logvar_features_0.reshape(-1, logvar_features_0.shape[-1]),
+        #                        mu_features_0.reshape(-1, mu_features_0.shape[-1]), reduce='none')
         loss_kl_feat = calc_kl(logvar_features_0.reshape(-1, logvar_features_0.shape[-1]),
-                               mu_features_0.reshape(-1, mu_features_0.shape[-1]), reduce='none')
+                               mu_features_0.reshape(-1, mu_features_0.shape[-1]), 
+                               mu_o = mu_w_feat,
+                               logvar_o= logvar_w_feat,
+                               reduce='none')
+
         loss_kl_feat_obj = loss_kl_feat.view(-1, num_static, self.n_kp_enc)
         loss_kl_feat_obj = loss_kl_feat_obj.sum(dim=(-2, -1)).mean()
 
@@ -3068,9 +3223,13 @@ class ObjectDynamicsDLP(nn.Module):
         loss_kl_feat = loss_kl_feat_obj + loss_kl_feat_bg
 
         # --- end kl-divergence for t < tau --- #
-        loss_kl = loss_kl_kp + loss_kl_scale + loss_kl_obj_on + kl_balance * (loss_kl_feat + loss_kl_depth)
+        # _ET_ updates for conditional prior 
+        # loss_kl = loss_kl_kp + loss_kl_scale + loss_kl_obj_on + kl_balance * (loss_kl_feat + loss_kl_depth)
+        gmvae_loss_kl = conditional_prior_loss + z_prior_loss + w_prior_loss + loss_kl_kp + loss_kl_scale + loss_kl_obj_on + kl_balance * (loss_kl_feat + loss_kl_depth) 
+        
         # return loss_kl_depth, loss_kl_scale, loss_kl_obj_on, loss_kl_feat,obj_on_l1,loss_kl_kp
-        return loss_kl, loss_kl_depth, loss_kl_scale, loss_kl_obj_on, loss_kl_feat,obj_on_l1,loss_kl_kp
+        # return loss_kl, loss_kl_depth, loss_kl_scale, loss_kl_obj_on, loss_kl_feat,obj_on_l1,loss_kl_kp
+        return gmvae_loss_kl, loss_kl_depth, loss_kl_scale, loss_kl_obj_on, loss_kl_feat,obj_on_l1,loss_kl_kp
 
     def LREC(self,
                           x,
@@ -3769,3 +3928,5 @@ class ObjectDynamicsDLP(nn.Module):
             other_param = other.parameters()
             for p, p_other in zip(params, other_param):
                 p.data.lerp_(p_other.data, 1.0 - betta)
+
+
