@@ -215,7 +215,7 @@ def train_ddlp(config_path='./configs/balls.json'):
             x = batch[0].to(device)
 
             # the input image to the prior is the same as the posterior
-            # TODO understand this
+            # FIXME understand this
             x_prior = x  
 
             noisy = (epoch < (warmup_epoch + 1))

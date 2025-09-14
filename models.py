@@ -122,7 +122,7 @@ class FgDLP(nn.Module):
                                                                use_correlation_heatmaps=use_correlation_heatmaps,
                                                                enable_attn=self.enable_enc_attn, attn_dropout=0.0)
         # appearance encoder - visual features encoder (z_f)
-        self.particle_attribute_conditional_prior = GMCondPrior()
+        # self.particle_attribute_conditional_prior = GMCondPrior()
         self.particle_features_enc = ParticleFeaturesEncoder(anchor_s, learned_feature_dim,
                                                              image_size,
                                                              cnn_channels=prior_channels,
@@ -292,26 +292,76 @@ class FgDLP(nn.Module):
         else:
             z_features = reparameterize(mu_features, logvar_features)
 
+        ## === GMVAE ADDITION === ##
         ## encode the posterior p(w | x) for GMVAE 
         # attributes 
         mu_wpost_a, var_wpost_a  = self.attribute_cp_enc(x)
 
-        # sample from the posterior p (w | x) using the reparametrization trick
-        w_a = reparameterize(mu_wpost_a, var_wpost_a)
+         # determine expected component sizes from posterior latents
+        dim_off = mu_offset.shape[-1]
+        dim_scale = mu_scale.shape[-1]
+        dim_feat = mu_features.shape[-1]
+        dim_depth = mu_depth.shape[-1]
+       
+        # slice w in a per feature manner
+        # encoded w will give the parameters for each portion of the distirbution
+        s0 = 0
+        s1 = s0 + dim_off
+        s2 = s1 + dim_scale
+        s3 = s2 + dim_feat
+        s4 = s3 + dim_depth
 
-        encode_dict = {'mu': mu, 'logvar': logvar, 'z_base': z_base, 'z': z, 'kp_heatmap': kp_heatmap,
-                       'mu_features': mu_features, 'logvar_features': logvar_features, 'z_features': z_features,
-                       'obj_on_a': obj_on_a, 'obj_on_b': obj_on_b, 'obj_on': z_obj_on,
-                       'mu_depth': mu_depth, 'logvar_depth': logvar_depth, 'z_depth': z_depth,
-                       'cropped_objects': cropped_objects,
-                       'mu_scale': mu_scale, 'logvar_scale': logvar_scale, 'z_scale': z_scale,
-                       'mu_offset': mu_offset, 
-                       'logvar_offset': logvar_offset, 
-                       'z_offset': z_offset,
-                       'mu_wpost_a': mu_wpost_a,
-                       'var_wpost_a': var_wpost_a,
-                       'w_a': w_a}
+        mu_w_offset = mu_wpost_a[..., s0:s1].reshape(-1, dim_off)   # [B'*K?, dim_off] -> will match mu_offset flattened
+        mu_w_scale  = mu_wpost_a[..., s1:s2].reshape(-1, dim_scale)
+        mu_w_feat   = mu_wpost_a[..., s2:s3].reshape(-1, dim_feat)
+        mu_w_depth  = mu_wpost_a[..., s3:s4].reshape(-1, dim_depth)
+
+        logvar_w_offset = var_wpost_a[..., s0:s1].reshape(-1, dim_off)
+        logvar_w_scale  = var_wpost_a[..., s1:s2].reshape(-1, dim_scale)
+        logvar_w_feat   = var_wpost_a[..., s2:s3].reshape(-1, dim_feat)
+        logvar_w_depth  = var_wpost_a[..., s3:s4].reshape(-1, dim_depth)
+
+
+        # sample from the posterior p (w | x) using the reparametrization trick
+        # w_a = reparameterize(mu_wpost_a, var_wpost_a)
+
+        # encode_dict = {'mu': mu, 'logvar': logvar, 'z_base': z_base, 'z': z, 'kp_heatmap': kp_heatmap,
+        #                'mu_features': mu_features, 'logvar_features': logvar_features, 'z_features': z_features,
+        #                'obj_on_a': obj_on_a, 'obj_on_b': obj_on_b, 'obj_on': z_obj_on,
+        #                'mu_depth': mu_depth, 'logvar_depth': logvar_depth, 'z_depth': z_depth,
+        #                'cropped_objects': cropped_objects,
+        #                'mu_scale': mu_scale, 'logvar_scale': logvar_scale, 'z_scale': z_scale,
+        #                'mu_offset': mu_offset, 
+        #                'logvar_offset': logvar_offset, 
+        #                'z_offset': z_offset,
+        #                'mu_wpost_a': mu_wpost_a,
+        #                'var_wpost_a': var_wpost_a,}
+        # ...existing code...
+        encode_dict = {'mu': mu, 
+                       'logvar': logvar, 
+                       'z_base': z_base, 
+                       'z': z, 'kp_heatmap': kp_heatmap,
+                        'mu_features': mu_features, 'logvar_features': logvar_features, 'z_features': z_features,
+                        'obj_on_a': obj_on_a, 'obj_on_b': obj_on_b, 'obj_on': z_obj_on,
+                        'mu_depth': mu_depth, 'logvar_depth': logvar_depth, 'z_depth': z_depth,
+                        'cropped_objects': cropped_objects,
+                        'mu_scale': mu_scale, 'logvar_scale': logvar_scale, 'z_scale': z_scale,
+                        'mu_offset': mu_offset, 
+                        'logvar_offset': logvar_offset, 
+                        'z_offset': z_offset,
+                        'mu_wpost_a': mu_wpost_a,
+                        'var_wpost_a': var_wpost_a,
+                        # per-feature splits for GMVAE encoder (added)
+                        'mu_w_offset': mu_w_offset,
+                        'mu_w_scale': mu_w_scale,
+                        'mu_w_feat': mu_w_feat,
+                        'mu_w_depth': mu_w_depth,
+                        'logvar_w_offset': logvar_w_offset,
+                        'logvar_w_scale': logvar_w_scale,
+                        'logvar_w_feat': logvar_w_feat,
+                        'logvar_w_depth': logvar_w_depth,}
         return encode_dict
+       
 
     def encode_prior(self, x, x_prior=None, filtering_heuristic='variance', k=None):
         # encodes prior keypoints by patchifying the image and applying spatial-softmax
@@ -407,13 +457,19 @@ class FgDLP(nn.Module):
         # stitching the decoded latent particles -> RGB, factoring the alpha maps and depths
         dec_objects, a_obj, rgb_obj = self.get_objects_alpha_rgb(z_kp, z_features, z_scale=z_scale,
                                                                  translation=translation, noisy=noisy)
-        alpha_masks, bg_mask, dec_objects_trans = self.get_objects_alpha_rgb_with_depth(a_obj, rgb_obj, obj_on=obj_on,
+        alpha_masks, bg_mask, dec_objects_trans = self.get_objects_alpha_rgb_with_depth(a_obj, rgb_obj, 
+                                                                                        obj_on=obj_on,
                                                                                         z_depth=z_depth)
         return dec_objects, dec_objects_trans, alpha_masks, bg_mask
 
     def decode_all(self, z, z_features, obj_on, w_a, z_depth=None, noisy=False, z_scale=None):
         # a wrapper function to decode latent particles into and RGB image (no bg)
-        object_dec_out = self.decode_objects(z, z_features, obj_on, noisy=noisy, z_depth=z_depth, z_scale=z_scale)
+        object_dec_out = self.decode_objects(z, 
+                                             z_features, 
+                                             obj_on, 
+                                             noisy=noisy, 
+                                             z_depth=z_depth, 
+                                             z_scale=z_scale)
         dec_objects, dec_objects_trans, alpha_masks, bg_mask = object_dec_out
 
         ## decode the parameters of the distribution p( * |w,y)
@@ -468,7 +524,12 @@ class FgDLP(nn.Module):
 
         obj_on_sample = obj_on
 
-        decoder_out = self.decode_all(z, z_features, obj_on_sample, z_depth, noisy=noisy, z_scale=z_scale)
+        decoder_out = self.decode_all(z,
+                                      z_features, 
+                                      obj_on_sample, 
+                                      z_depth, 
+                                      noisy=noisy, 
+                                      z_scale=z_scale)
         dec_objects = decoder_out['dec_objects']
         dec_objects_trans = decoder_out['dec_objects_trans']
         bg_mask = decoder_out['bg_mask']
@@ -2917,6 +2978,7 @@ class ObjectDynamicsDLP(nn.Module):
                     logvar_w_enc_fg,
                      batch_size,
                      num_static,
+                     K_gm = 16,
                      kl_balance=0.001,
                      warmup=False,
                      noisy=False):
@@ -3019,76 +3081,60 @@ class ObjectDynamicsDLP(nn.Module):
 
         # Prepare burn-in (t < tau) per-particle latents and (optional) w-encodings.
         # In the paper 'x' corresponds to the continuous latent; in this implementation 'x' == concatenated z (offset, scale, features, depth).
-        bs = mu_features_0.shape[0]
         t_burn = mu_features_0.shape[1]
-        K = self.n_kp_enc
         device = mu_features_0.device
 
-        # build mu_x / logvar_x by concatenating the continuous per-particle latents (offset, scale, features, depth)
+        # build mu_x / logvar_x by concatenating the continuous 
+        # per-particle latents (offset, scale, features, depth)
         # shapes: [bs, t_burn, K, dim_*]
         mu_x_0 = torch.cat([mu_offset_0, mu_scale_0, mu_features_0, mu_depth_0], dim=-1)
         logvar_x_0 = torch.cat([logvar_offset_0, logvar_scale_0, logvar_features_0, logvar_depth_0], dim=-1)
 
-        # flatten to batch dimension expected by calc_gmvae_loss: B' = bs * t_burn * K
+        # flatten to batch dimension expected by calc_gmvae_loss: B' = batch_size * t_burn * K
         mu_x = mu_x_0.reshape(-1, mu_x_0.shape[-1])         # [B', D_x]
         logvar_x = logvar_x_0.reshape(-1, logvar_x_0.shape[-1])  # [B', D_x]
 
         # If encodings for w (mu_w_enc_fg / logvar_w_enc_fg) are provided, split them per-feature.
         # Expected per-particle layout: [offset | scale | features | depth] (concatenated).
-        if (mu_w_enc_fg is not None) and (logvar_w_enc_fg is not None):
-            # reshape to [bs, t_burn, K, dim_w]
-            mu_w_full = mu_w_enc_fg.reshape(batch_size, self.timestep_horizon + 1, *mu_w_enc_fg.shape[1:])[:, :num_static]
-            mu_w_full = mu_w_full.reshape(-1, K, mu_w_full.shape[-1])  # [bs * t_burn, K, dim_w]
-            logvar_w_full = logvar_w_enc_fg.reshape(batch_size, self.timestep_horizon + 1, *logvar_w_enc_fg.shape[1:])[:, :num_static]
-            logvar_w_full = logvar_w_full.reshape(-1, K, logvar_w_full.shape[-1])
+    
+        # reshape to [batch_size, t_burn, K_gm, dim_w]
+        # mu_w_full = mu_w_enc_fg.reshape(batch_size, self.timestep_horizon + 1, *mu_w_enc_fg.shape[1:])[:, :num_static]
+        # mu_w_full = mu_w_full.reshape(-1, K_gm, mu_w_full.shape[-1])  # [bs * t_burn, K_gm, dim_w]
+        # logvar_w_full = logvar_w_enc_fg.reshape(batch_size, self.timestep_horizon + 1, *logvar_w_enc_fg.shape[1:])[:, :num_static]
+        # logvar_w_full = logvar_w_full.reshape(-1, K_gm, logvar_w_full.shape[-1])
+ 
+        # # determine expected component sizes from posterior latents
+        # dim_off = mu_offset_0.shape[-1]
+        # dim_scale = mu_scale_0.shape[-1]
+        # dim_feat = mu_features_0.shape[-1]
+        # dim_depth = mu_depth_0.shape[-1]
+        # expected = dim_off + dim_scale + dim_feat + dim_depth
+        # actual = mu_w_full.shape[-1]
+        # if actual < expected:
+        #     raise RuntimeError(f"mu_w_enc_fg has {actual} dims, expected >= {expected} (offset,scale,feat,depth).")
 
-            # determine expected component sizes from posterior latents
-            dim_off = mu_offset_0.shape[-1]
-            dim_scale = mu_scale_0.shape[-1]
-            dim_feat = mu_features_0.shape[-1]
-            dim_depth = mu_depth_0.shape[-1]
-            expected = dim_off + dim_scale + dim_feat + dim_depth
-            actual = mu_w_full.shape[-1]
-            if actual < expected:
-                raise RuntimeError(f"mu_w_enc_fg has {actual} dims, expected >= {expected} (offset,scale,feat,depth).")
+        # # slice w in a per feature manner
+        # # encoded w will give the parameters for each portion of the distirbution
+        # s0 = 0
+        # s1 = s0 + dim_off
+        # s2 = s1 + dim_scale
+        # s3 = s2 + dim_feat
+        # s4 = s3 + dim_depth
 
-            # slice per-feature
-            s0 = 0
-            s1 = s0 + dim_off
-            s2 = s1 + dim_scale
-            s3 = s2 + dim_feat
-            s4 = s3 + dim_depth
+        # mu_w_offset = mu_w_full[..., s0:s1].reshape(-1, dim_off)   # [B'*K?, dim_off] -> will match mu_offset flattened
+        # mu_w_scale  = mu_w_full[..., s1:s2].reshape(-1, dim_scale)
+        # mu_w_feat   = mu_w_full[..., s2:s3].reshape(-1, dim_feat)
+        # mu_w_depth  = mu_w_full[..., s3:s4].reshape(-1, dim_depth)
 
-            mu_w_offset = mu_w_full[..., s0:s1].reshape(-1, dim_off)   # [B'*K?, dim_off] -> will match mu_offset flattened
-            mu_w_scale  = mu_w_full[..., s1:s2].reshape(-1, dim_scale)
-            mu_w_feat   = mu_w_full[..., s2:s3].reshape(-1, dim_feat)
-            mu_w_depth  = mu_w_full[..., s3:s4].reshape(-1, dim_depth)
+        # logvar_w_offset = logvar_w_full[..., s0:s1].reshape(-1, dim_off)
+        # logvar_w_scale  = logvar_w_full[..., s1:s2].reshape(-1, dim_scale)
+        # logvar_w_feat   = logvar_w_full[..., s2:s3].reshape(-1, dim_feat)
+        # logvar_w_depth  = logvar_w_full[..., s3:s4].reshape(-1, dim_depth)
 
-            logvar_w_offset = logvar_w_full[..., s0:s1].reshape(-1, dim_off)
-            logvar_w_scale  = logvar_w_full[..., s1:s2].reshape(-1, dim_scale)
-            logvar_w_feat   = logvar_w_full[..., s2:s3].reshape(-1, dim_feat)
-            logvar_w_depth  = logvar_w_full[..., s3:s4].reshape(-1, dim_depth)
-
-            # full w encoding per-particle as required by calc_gmvae_loss: [B', D_w]
-            mu_w = mu_w_full.reshape(-1, mu_w_full.shape[-1])
-            logvar_w = logvar_w_full.reshape(-1, logvar_w_full.shape[-1])
-        else:
-            # fallback: build a simple w-encoding from posterior statistics (mean/var of mu_x)
-            mu_w = mu_x.clone()
-            logvar_w = logvar_x.clone()
-            # provide per-feature fallbacks so later calc_kl calls do not break
-            mu_w_offset = mu_x[:, :mu_offset_0.shape[-1]]
-            mu_w_scale = mu_x[:, mu_offset_0.shape[-1]:mu_offset_0.shape[-1] + mu_scale_0.shape[-1]]
-            mu_w_feat = mu_x[:, mu_offset_0.shape[-1] + mu_scale_0.shape[-1]:
-                                mu_offset_0.shape[-1] + mu_scale_0.shape[-1] + mu_features_0.shape[-1]]
-            mu_w_depth = mu_x[:, -mu_depth_0.shape[-1]:]
-
-            logvar_w_offset = logvar_x[:, :mu_w_offset.shape[-1]]
-            logvar_w_scale = logvar_x[:, mu_w_offset.shape[-1]:mu_w_offset.shape[-1] + mu_w_scale.shape[-1]]
-            logvar_w_feat = logvar_x[:, mu_w_offset.shape[-1] + mu_w_scale.shape[-1]:
-                                        mu_w_offset.shape[-1] + mu_w_scale.shape[-1] + mu_w_feat.shape[-1]]
-            logvar_w_depth = logvar_x[:, -mu_w_depth.shape[-1]:]
-
+        # full w encoding per-particle as required by calc_gmvae_loss: [B', D_w]
+        mu_w = mu_w_full.reshape(-1, mu_w_full.shape[-1])
+        logvar_w = logvar_w_full.reshape(-1, logvar_w_full.shape[-1])
+    
         # Monte-Carlo samples for calc_gmvae_loss: repeat for M*2 to match the implementation in utils.loss_functions
         M = 10
         mc_w_samples = reparameterize(mu_w.repeat(M * 2, 1), logvar_w.repeat(M * 2, 1))
