@@ -11,6 +11,58 @@ import torch.nn.functional as F
 import torch.nn as nn
 from utils.util_func import spatial_transform, generate_correlation_maps
 
+class VGMEncoder(nn.Module):
+    def __init__(self,
+                 c_in = 3,
+                 hidden_c1 = 2**3,
+                 hidden_c2 = 2**3,
+                 K=2**4,
+                 variational_params=2,
+                 kernel_size=3):
+        """
+        c_in: input channels (default is rgb image)
+        K : number of cluster centers in gaussian mixture
+        variational_params : number of params we need to learn to 
+        in order to parametrize variational distribution. Default is 2 
+        which supports beta, gaussian 
+        """ 
+        super().__init__()
+        self.enc = nn.Sequential(
+            ConvBlock(c_in=c_in,c_out=hidden_c1,kernel_size=kernel_size,use_resblock=True),
+            ConvBlock(c_in=hidden_c1,c_out=hidden_c2,kernel_size=kernel_size,use_resblock=True),
+            ConvBlock(c_in=hidden_c2,c_out=K*variational_params,kernel_size=kernel_size,use_resblock=True),
+        )
+        
+    def forward(self,x):
+        ## return a 
+        res = self.enc(x)
+        return torch.chunk(res,chunks=2,dim=0)
+
+class VGMDecoder(nn.Module):
+    def __init__(self,
+                 K=16,
+                 variational_params_beta=2,
+                 latent_dim=2**5,
+                 h1=2**5,
+                 h2=2**4,
+                 activation='gelu'):
+        super().__init__()
+        in_dim = K * variational_params_beta
+
+        self.fc_1 = nn.Linear(in_dim, h1)
+        self.fc_2 = nn.Linear(h1,h2)
+        self.fc_3 = nn.Linear(h2,variational_params_beta*latent_dim)
+        if activation == 'gelu':
+            self.act = nn.GELU()
+        else:
+            self.act = nn.ReLU(True)
+    
+
+    def forward(self, x):
+        fc1_out = self.act(self.fc_1(x))
+        fc2_out = self.act(self.fc_2(fc1_out))
+        res = self.act(self.fc_3(fc2_out))
+        return res
 
 # ResBlock from: https://pytorch.org/vision/0.8/_modules/torchvision/models/resnet.html
 def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1, padding='zeros'):
