@@ -36,18 +36,19 @@ class VGMEncoder(nn.Module):
     def forward(self,x):
         ## return a 
         res = self.enc(x)
-        return torch.chunk(res,chunks=2,dim=0)
+        return res
+        # return torch.chunk(res,chunks=2,dim=0)
 
 class VGMDecoder(nn.Module):
     def __init__(self,
-                 K=16,
+                in_dim = 13, # sum of attributes we are encoding, explicitly
                  variational_params_beta=2,
                  latent_dim=2**5,
                  h1=2**5,
                  h2=2**4,
                  activation='gelu'):
         super().__init__()
-        in_dim = K * variational_params_beta
+        # in_dim = K * variational_params_beta
 
         self.fc_1 = nn.Linear(in_dim, h1)
         self.fc_2 = nn.Linear(h1,h2)
@@ -62,7 +63,7 @@ class VGMDecoder(nn.Module):
         fc1_out = self.act(self.fc_1(x))
         fc2_out = self.act(self.fc_2(fc1_out))
         res = self.act(self.fc_3(fc2_out))
-        return res
+        return torch.chunk(res,chunks=2,dim=0)
 
 # ResBlock from: https://pytorch.org/vision/0.8/_modules/torchvision/models/resnet.html
 def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1, padding='zeros'):

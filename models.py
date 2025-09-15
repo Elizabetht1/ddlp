@@ -296,7 +296,7 @@ class FgDLP(nn.Module):
         ## === GMVAE ADDITION === ##
         ## encode the posterior p(w | x) for GMVAE 
         # attributes 
-        mu_wpost_a, var_wpost_a  = self.attribute_cp_enc(x)
+        w_post_a = self.attribute_cp_enc(x)
 
          # determine expected component sizes from posterior latents
         dim_off = mu_offset.shape[-1]
@@ -312,15 +312,21 @@ class FgDLP(nn.Module):
         s3 = s2 + dim_feat
         s4 = s3 + dim_depth
 
-        mu_w_offset = mu_wpost_a[..., s0:s1].reshape(-1, dim_off)   # [B'*K?, dim_off] -> will match mu_offset flattened
-        mu_w_scale  = mu_wpost_a[..., s1:s2].reshape(-1, dim_scale)
-        mu_w_feat   = mu_wpost_a[..., s2:s3].reshape(-1, dim_feat)
-        mu_w_depth  = mu_wpost_a[..., s3:s4].reshape(-1, dim_depth)
+        w_offset = w_post_a[..., s0:s1].reshape(-1, dim_off)   # [B'*K?, dim_off] -> will match mu_offset flattened
+        w_scale  = w_post_a[..., s1:s2].reshape(-1, dim_scale)
+        w_feat   = w_post_a[..., s2:s3].reshape(-1, dim_feat)
+        w_depth  = w_post_a[..., s3:s4].reshape(-1, dim_depth)
 
-        logvar_w_offset = var_wpost_a[..., s0:s1].reshape(-1, dim_off)
-        logvar_w_scale  = var_wpost_a[..., s1:s2].reshape(-1, dim_scale)
-        logvar_w_feat   = var_wpost_a[..., s2:s3].reshape(-1, dim_feat)
-        logvar_w_depth  = var_wpost_a[..., s3:s4].reshape(-1, dim_depth)
+
+        # mu_w_offset = mu_wpost_a[..., s0:s1].reshape(-1, dim_off)   # [B'*K?, dim_off] -> will match mu_offset flattened
+        # mu_w_scale  = mu_wpost_a[..., s1:s2].reshape(-1, dim_scale)
+        # mu_w_feat   = mu_wpost_a[..., s2:s3].reshape(-1, dim_feat)
+        # mu_w_depth  = mu_wpost_a[..., s3:s4].reshape(-1, dim_depth)
+
+        # logvar_w_offset = var_wpost_a[..., s0:s1].reshape(-1, dim_off)
+        # logvar_w_scale  = var_wpost_a[..., s1:s2].reshape(-1, dim_scale)
+        # logvar_w_feat   = var_wpost_a[..., s2:s3].reshape(-1, dim_feat)
+        # logvar_w_depth  = var_wpost_a[..., s3:s4].reshape(-1, dim_depth)
 
 
         # sample from the posterior p (w | x) using the reparametrization trick
@@ -350,17 +356,13 @@ class FgDLP(nn.Module):
                         'mu_offset': mu_offset, 
                         'logvar_offset': logvar_offset, 
                         'z_offset': z_offset,
-                        'mu_wpost_a': mu_wpost_a,
-                        'var_wpost_a': var_wpost_a,
+                        'wpost_a': w_post_a,
                         # per-feature splits for GMVAE encoder (added)
-                        'mu_w_offset': mu_w_offset,
-                        'mu_w_scale': mu_w_scale,
-                        'mu_w_feat': mu_w_feat,
-                        'mu_w_depth': mu_w_depth,
-                        'logvar_w_offset': logvar_w_offset,
-                        'logvar_w_scale': logvar_w_scale,
-                        'logvar_w_feat': logvar_w_feat,
-                        'logvar_w_depth': logvar_w_depth,}
+                        'w_offset': w_offset,
+                        'w_scale':w_scale,
+                        'w_feat': w_feat,
+                        'w_depth': w_depth,
+                        }
         return encode_dict
        
 
@@ -463,7 +465,20 @@ class FgDLP(nn.Module):
                                                                                         z_depth=z_depth)
         return dec_objects, dec_objects_trans, alpha_masks, bg_mask
 
-    def decode_all(self, z, z_features, obj_on, w_a, z_depth=None, noisy=False, z_scale=None):
+    def decode_all(self, 
+                   z, 
+                   z_features, 
+                   obj_on, 
+                   z_depth=None, 
+                   w_offset = None,
+                    w_depth = None,
+                    w_feat = None,
+                    w_scale = None,
+                   noisy=False, 
+                   z_scale=None):
+
+        if (z_scale is None) or (z_depth is None) or (w_offset is None) or (w_depth is None) or (w_feat is None) or (w_scale is None):
+            raise Exception("latent parameter not passed for decoding")
         # a wrapper function to decode latent particles into and RGB image (no bg)
         object_dec_out = self.decode_objects(z, 
                                              z_features, 
@@ -474,15 +489,23 @@ class FgDLP(nn.Module):
         dec_objects, dec_objects_trans, alpha_masks, bg_mask = object_dec_out
 
         ## decode the parameters of the distribution p( * |w,y)
-        mu_beta_a, var_beta_a = self.attribute_cp_dec(w_a)
+        mu_beta_a, var_beta_a = self.attribute_cp_dec(
+            torch.concat([
+                w_offset,
+                w_depth,
+                w_scale,
+                w_feat],dim=-1
+            )
+        )
+
 
 
         decoder_out = {'dec_objects': dec_objects, 
                        'dec_objects_trans': dec_objects_trans,
                        'bg_mask': bg_mask, 
                        'alpha_masks': alpha_masks,
-                       'mu_beta_a': mu_beta_a,
-                       'var_beta_a': var_beta_a}
+                       'beta_mu_a': mu_beta_a,
+                       'beta_var_a': var_beta_a}
 
         return decoder_out
 
@@ -2464,6 +2487,16 @@ class ObjectDynamicsDLP(nn.Module):
         logvar_scale = fg_dict['logvar_scale']
         z_scale = fg_dict['z_scale']
 
+        w_offset = fg_dict['w_offset']
+        w_scale = fg_dict['w_scale']
+        w_feat = fg_dict['w_feat']
+        w_depth = fg_dict['w_depth']
+        # logvar_w_offset = fg_dict['logvar_w_offset']
+        # logvar_w_scale = fg_dict['logvar_w_scale']
+        # logvar_w_feat = fg_dict['logvar_w_feat']
+        # logvar_w_depth = fg_dict['logvar_w_depth']
+
+
         # initialize lists to collect all outputs
         mus, logvars, zs, z_bases = [mu], [logvar], [z], [z_base]
         mu_offsets, logvar_offsets = [mu_offset], [logvar_offset]
@@ -2556,8 +2589,18 @@ class ObjectDynamicsDLP(nn.Module):
         z_obj_ons_dec = z_obj_ons.view(-1, *z_obj_ons.shape[2:])
         z_depths_dec = z_depths.view(-1, *z_depths.shape[2:])
         z_scales_dec = z_scales.view(-1, *z_scales.shape[2:])
-        decoder_out = self.fg_module.decode_all(zs_dec, z_featuress_dec, z_obj_ons_dec, z_depths_dec, noisy=noisy,
-                                                z_scale=z_scales_dec)
+        decoder_out = self.fg_module.decode_all(
+            z = zs_dec,
+            z_features= z_featuress_dec, 
+            obj_on=z_obj_ons_dec, 
+            z_depth=z_depths_dec, 
+            noisy=noisy,
+            z_scale = z_scales_dec,
+            w_offset = w_offset,
+            w_depth = w_depth,
+            w_feat = w_feat,
+            w_scale = w_scale
+            )
         dec_objectss = decoder_out['dec_objects']
         dec_objects_transs = decoder_out['dec_objects_trans']
         bg_masks = decoder_out['bg_mask']
@@ -2598,7 +2641,9 @@ class ObjectDynamicsDLP(nn.Module):
                        'cropped_objects_original': cropped_objectss, 'obj_on_a': obj_on_as, 'obj_on_b': obj_on_bs,
                        'obj_on': z_obj_ons, 'dec_objects_original': dec_objectss, 'dec_objects': dec_objects_transs,
                        'mu_depth': mu_depths, 'logvar_depth': logvar_depths, 'z_depth': z_depths, 'mu_scale': mu_scales,
-                       'logvar_scale': logvar_scales, 'z_scale': z_scales, 'alpha_masks': alpha_maskss}
+                       'logvar_scale': logvar_scales, 'z_scale': z_scales, 'alpha_masks': alpha_maskss,
+                       'beta_mu_a':decoder_out['beta_mu_a'],
+                       'beta_var_a':decoder_out['beta_var_a']}
         return output_dict
 
     def forward(self, x, deterministic=False, bg_masks_from_fg=False, x_prior=None, warmup=False, noisy=False,
