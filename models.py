@@ -15,7 +15,8 @@ from modules.modules import VGMDecoder,VGMEncoder,ParticleAttributeEncoder, Part
 from modules.dynamics_modules import DynamicsDLP
 # util functions
 from utils.util_func import reparameterize, create_masks_fast, spatial_transform, calc_model_size
-from utils.loss_functions import calc_gmvae_loss, ChamferLossKL, calc_kl, calc_reconstruction_loss, VGGDistance, calc_kl_beta_dist
+from utils.loss_functions import ChamferLossKL, calc_kl, calc_reconstruction_loss, VGGDistance, calc_kl_beta_dist
+from utils.gmvae_loss import calc_gmvae_loss
 
 class FgDLP(nn.Module):
     def __init__(self, 
@@ -3149,7 +3150,7 @@ class ObjectDynamicsDLP(nn.Module):
         y_burn = mu_x
 
         # Call the black-box GMVAE loss for burn-in frames only.
-        conditional_prior_loss, w_prior_loss, z_prior_loss = calc_gmvae_loss(
+        conditional_prior_loss, z_prior_loss = calc_gmvae_loss(
             y=y_burn,
             mc_w_samples=mc_w_samples,
             mc_x_samples=mc_x_samples,
